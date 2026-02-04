@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  "Welcome to Jekyll!"
+title:  "The Amasing Portfolio"
 date:   2026-02-04 14:12:26 +0100
 categories: jekyll update
 ---
