@@ -41,9 +41,12 @@ The result is a **cross-platform 3D renderer** capable of:
 ### Downloads & Links
 
 - **Windows build:**  
-  https://github.com/MuteBlind99/Graphic-Engine/releases/download/1.0/Graphic_Engine_win.zip  
+  [build](https://github.com/MuteBlind99/Graphic-Engine/releases/download/1.0/Graphic_Engine_win.zip) 
 - **Source code:**  
-  https://github.com/MuteBlind99/Graphic-Engine  
+  [github](https://github.com/MuteBlind99/Compgraphsample-MuteBlind99.git)
+
+ ![Image](/Source/Enregistrement 2026-02-10 161049.gif)
+
 
 ## 2. Project Architecture
 
@@ -172,6 +175,40 @@ The architecture prioritizes:
 
 This foundation proved robust enough to support advanced techniques such as deferred rendering, shadow mapping, SSAO, and large-scale instancing, which are detailed in the following sections.
 
+---
+
+### Example: “engine-style loop”
+
+The engine follows a simple and explicit lifecycle: Begin() allocates GPU resources, Update() handles input/camera, and Draw() executes the rendering passes. This keeps responsibilities clear and makes multi-pass pipelines easier to debug.
+
+```cpp
+// Example: System + Rendering lifecycle (Begin/Update/Draw)
+class FramebufferRenderer : public common::DrawInterface, public common::SystemInterface {
+public:
+    void Begin() override {
+        initGL();
+        createFramebuffer();
+        createScreenQuad();
+
+        model_ = std::make_unique<Model>("data/model/nanosuit2/nanosuit.obj");
+
+        createGBuffer(width_, height_);
+        // ... init post-process, skybox, etc.
+    }
+
+    void Update(float dt) override {
+        // input + camera
+        // yaw_/pitch_ updates from mouse
+    }
+
+    void Draw() override {
+        renderSceneToFramebuffer();
+        // then post-process / UI
+    }
+};
+```
+---
+
 ## 3. Asset Loading (Models & Textures)
 
 Efficient asset loading is a critical part of the engine, especially in a **deferred rendering architecture** where all geometric and material data must be prepared upfront during the geometry pass.
@@ -181,6 +218,8 @@ The asset system is designed with three main goals in mind:
 - Reliability (no missing or partially loaded assets)
 - Performance (minimal runtime overhead)
 - Scalability (support for complex scenes and large datasets)
+
+![Video](/Source/Enregistrement 2026-02-10 190504.gif)
 
 ---
 
@@ -317,12 +356,74 @@ The asset loading system provides:
 
 By front-loading all heavy work during asset initialization, the runtime rendering loop remains lightweight, predictable, and scalable — even with complex scenes and large object counts.
 
+---
+
+## Example: Assimp import + mesh extraction
+Models are imported with Assimp and decomposed into independent meshes. Textures are loaded via stb_image, uploaded once to the GPU, and configured with mipmaps and standard sampling parameters.
+
+- Import Assimp + loop meshes
+```cpp
+bool loadModelWithAssimp(const std::string& path) {
+    Assimp::Importer importer;
+
+    const aiScene* scene = importer.ReadFile(path,
+        aiProcess_Triangulate |
+        aiProcess_FlipUVs |
+        aiProcess_CalcTangentSpace |
+        aiProcess_GenNormals);
+
+    if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode) {
+        std::cout << "Assimp error: " << importer.GetErrorString() << std::endl;
+        return false;
+    }
+
+    for (unsigned int i = 0; i < scene->mNumMeshes; i++) {
+        aiMesh* aiMesh = scene->mMeshes[i];
+        Mesh mesh = processAIMesh(aiMesh, scene, directory);
+        meshes.push_back(mesh);
+    }
+    return true;
+}
+```
+
+- Texture loading with stb_image
+```cpp
+static GLuint loadTexture2D(const std::string &path, bool flipY) {
+    stbi_set_flip_vertically_on_load(flipY);
+
+    int w, h, comp;
+    unsigned char *data = stbi_load(path.c_str(), &w, &h, &comp, 0);
+    if (!data) {
+        std::cerr << "[Texture] FAILED: " << path
+                  << " reason: " << stbi_failure_reason() << "\n";
+        return 0;
+    }
+
+    GLenum format = (comp == 4) ? GL_RGBA : (comp == 1 ? GL_RED : GL_RGB);
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, format, w, h, 0, format, GL_UNSIGNED_BYTE, data);
+    glGenerateMipmap(GL_TEXTURE_2D);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    stbi_image_free(data);
+    return tex;
+}
+```
 ## 4. Rendering Pipeline – Deferred Rendering
 
 The core of the engine is built around a **Deferred Rendering** pipeline.
 This approach was chosen to efficiently handle scenes containing many dynamic light sources while keeping rendering costs predictable.
 
 In contrast to forward rendering, deferred shading decouples **geometry complexity** from **lighting complexity**, making it particularly well-suited for modern real-time scenes.
+
+
 
 ---
 
@@ -379,6 +480,60 @@ Key characteristics:
 - Heavy vertex processing, minimal fragment cost
 
 The output of this pass fully describes the scene’s visible surfaces and is reused by all subsequent passes.
+
+- gPosition
+![G-Buffer Position](/Source/Position.jpg)
+- gNormal
+![G-Buffer Normal](/Source/Normal.jpg)
+-gAlbedoSpec
+![G-Buffer Albedo](/Source/AlbedoSpec.jpg)
+
+### Example: G-Buffer creation (MRT)
+
+```cpp
+void createGBuffer(int width, int height) {
+    glGenFramebuffers(1, &gBuffer_);
+    glBindFramebuffer(GL_FRAMEBUFFER, gBuffer_);
+
+    // Position (RGBA16F)
+    glGenTextures(1, &gPosition_);
+    glBindTexture(GL_TEXTURE_2D, gPosition_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gPosition_, 0);
+
+    // Normal (RGBA16F)
+    glGenTextures(1, &gNormal_);
+    glBindTexture(GL_TEXTURE_2D, gNormal_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, gNormal_, 0);
+
+    // Albedo + Spec (RGBA16F)
+    glGenTextures(1, &gAlbedoSpec_);
+    glBindTexture(GL_TEXTURE_2D, gAlbedoSpec_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, gAlbedoSpec_, 0);
+
+    // Depth RBO
+    glGenRenderbuffers(1, &rboDepth_);
+    glBindRenderbuffer(GL_RENDERBUFFER, rboDepth_);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rboDepth_);
+
+    GLuint attachments[3] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
+    glDrawBuffers(3, attachments);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cerr << "G-Buffer incomplete!" << std::endl;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+```
 
 ---
 
@@ -530,6 +685,10 @@ The lighting system supports multiple light types simultaneously:
 
 All lights are evaluated additively during the lighting pass, making it easy to combine multiple light sources without additional geometry passes.
 
+![Directional light](/Source/Capture d’écran 2026-02-10 214044.png)
+![Point lights](/Source/Enregistrement 2026-02-10 214418.gif)
+![Spot light](/Source/Enregistrement 2026-02-10 214248.gif)
+
 ---
 
 ### Shadow Mapping Overview
@@ -540,6 +699,40 @@ Shadows are implemented using **shadow mapping**, a two-step process:
 2. Compare fragment depth against the stored depth during lighting
 
 Shadow calculations are fully integrated into the deferred lighting pass, allowing shadows to affect both diffuse and specular lighting contributions.
+
+
+**Example: directional shadow map FBO**
+
+```cpp
+  void initShadowMapping() {
+    glGenFramebuffers(1, &shadowFBO_);
+
+    glGenTextures(1, &shadowDepthTex_);
+    glBindTexture(GL_TEXTURE_2D, shadowDepthTex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F,
+                 SHADOW_WIDTH, SHADOW_HEIGHT, 0,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+
+    float borderColor[] = {1.f, 1.f, 1.f, 1.f};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, shadowFBO_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, shadowDepthTex_, 0);
+
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        std::cerr << "ERROR: Shadow FBO not complete!" << std::endl;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+```
 
 ---
 
@@ -717,6 +910,93 @@ This blur:
 
 The result is a clean, stable SSAO texture suitable for real-time use.
 
+**Examples: kernel/noise generation + SSAO pass**
+
+- Kernel + noise texture (init)
+
+```cpp
+void initSSAO() {
+    std::default_random_engine generator((unsigned)std::time(nullptr));
+    std::uniform_real_distribution<float> randomFloats(0.0f, 1.0f);
+
+    for (int i = 0; i < ssaoKernelSize_; ++i) {
+        core::Vec3F sample(
+            randomFloats(generator) * 2.0f - 1.0f,
+            randomFloats(generator) * 2.0f - 1.0f,
+            randomFloats(generator)
+        );
+
+        float len = std::sqrt(sample.x*sample.x + sample.y*sample.y + sample.z*sample.z);
+        sample = (len > 0.0f) ? (sample * (1.0f / len)) : sample;
+
+        sample = sample * randomFloats(generator);
+
+        float scale = float(i) / float(ssaoKernelSize_);
+        scale = 0.1f + scale * scale * 0.9f;
+        sample = sample * scale;
+
+        ssaoKernel_.push_back(sample);
+    }
+
+    // 4x4 noise texture
+    std::vector<core::Vec3F> ssaoNoise;
+    for (int i = 0; i < 16; i++)
+        ssaoNoise.push_back({ randomFloats(generator)*2.f-1.f, randomFloats(generator)*2.f-1.f, 0.f });
+
+    glGenTextures(1, &noiseTexture_);
+    glBindTexture(GL_TEXTURE_2D, noiseTexture_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, 4, 4, 0, GL_RGB, GL_FLOAT, &ssaoNoise[0]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+}
+```
+
+- SSAO pass + blur pass
+
+```cpp
+void renderSSAOPass(float *proj) {
+    glBindFramebuffer(GL_FRAMEBUFFER, ssaoFBO_);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(ssaoProgram_);
+
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, gPosition_);
+    glUniform1i(glGetUniformLocation(ssaoProgram_, "gPosition"), 0);
+
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, gNormal_);
+    glUniform1i(glGetUniformLocation(ssaoProgram_, "gNormal"), 1);
+
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, noiseTexture_);
+    glUniform1i(glGetUniformLocation(ssaoProgram_, "texNoise"), 2);
+
+    int samplesToUse = std::min(64, ssaoKernelSize_);
+    for (int i = 0; i < samplesToUse; ++i) {
+        std::string name = "samples[" + std::to_string(i) + "]";
+        glUniform3f(glGetUniformLocation(ssaoProgram_, name.c_str()),
+                    ssaoKernel_[i].x, ssaoKernel_[i].y, ssaoKernel_[i].z);
+    }
+
+    glUniformMatrix4fv(glGetUniformLocation(ssaoProgram_, "projection"), 1, GL_FALSE, proj);
+    glUniform1f(glGetUniformLocation(ssaoProgram_, "radius"), ssaoRadius_);
+    glUniform1f(glGetUniformLocation(ssaoProgram_, "bias"), ssaoBias_);
+
+    glBindVertexArray(quadVAO_);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    // Blur
+    glBindFramebuffer(GL_FRAMEBUFFER, ssaoBlurFBO_);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(ssaoBlurProgram_);
+
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, ssaoColorBuffer_);
+    glUniform1i(glGetUniformLocation(ssaoBlurProgram_, "ssaoInput"), 0);
+
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+```
+
 ---
 
 ### Integration with Lighting
@@ -727,6 +1007,8 @@ During the lighting pass, the SSAO value is used to modulate the ambient lightin
 - Open areas remain mostly unaffected
 
 This keeps SSAO subtle and physically plausible, avoiding overly dark or stylized results.
+
+![SSAO enabled](/Source/Capture d’écran 2026-02-10 215249.png)
 
 ---
 
@@ -761,6 +1043,15 @@ Building a modern rendering engine goes far beyond implementing algorithms.
 A significant part of the work involved identifying subtle bugs, performance bottlenecks, and visual artifacts — and systematically fixing them.
 
 This section highlights the most important challenges encountered during development and the strategies used to solve them.
+
+---
+
+### Post-Processing via Framebuffers
+
+As part of the rendering experiments, several screen-space post-processing effects were implemented
+to validate framebuffer usage and full-screen quad rendering.
+
+![Post-processing effects](/Source/PostProcess.gif)
 
 ---
 
@@ -882,11 +1173,42 @@ The main challenges encountered during development included:
 
 Overcoming these challenges required a combination of strong tooling, careful design decisions, and iterative testing — all of which proved invaluable learning experiences.
 
+---
+
+### Example: “read back shadow depth” (RenderDoc-like validation)
+
+When shadows behaved incorrectly, I validated the depth map directly by reading back the depth texture and analyzing min/max ranges. This helped confirm whether the shadow pass was producing meaningful depth values before investigating sampling issues in the lighting shader.
+
+```cpp
+std::vector<float> depthData(SHADOW_WIDTH * SHADOW_HEIGHT);
+glBindTexture(GL_TEXTURE_2D, shadowDepthTex_);
+glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, depthData.data());
+glBindTexture(GL_TEXTURE_2D, 0);
+
+// Analyze depth range
+int validPixels = 0;
+float minDepth = 1.0f, maxDepth = 0.0f;
+
+for (float d : depthData) {
+    if (d < 1.0f) {
+        validPixels++;
+        minDepth = std::min(minDepth, d);
+        maxDepth = std::max(maxDepth, d);
+    }
+}
+
+std::cout << "Shadow depth stats: valid=" << validPixels
+          << " min=" << minDepth << " max=" << maxDepth << std::endl;
+```
+
+
 ## 8. Conclusion & Next Steps
 
 This project was an in-depth exploration of **modern real-time rendering** and the practical challenges involved in building a graphics engine from the ground up.
 
 By implementing a full **deferred rendering pipeline**, complete with dynamic lighting, shadow mapping, SSAO, and GPU instancing, I gained a much deeper understanding of how contemporary 3D engines operate at a low level.
+
+![Video](/Source/Enregistrement 2026-02-10 161049.gif)
 
 ---
 
@@ -925,8 +1247,6 @@ While the engine already supports a wide range of modern rendering features, sev
 - Bloom and HDR tone mapping
 - Physically Based Rendering (PBR)
 - Cascaded Shadow Maps (CSM) for directional lights
-- Frustum culling and GPU-driven visibility
-- Temporal effects (TAA, temporal SSAO)
 - Vulkan or DirectX 12 backend exploration
 
 These additions would further push the engine toward production-level rendering techniques.
@@ -941,4 +1261,6 @@ It combined theory, low-level API usage, performance optimization, and real-worl
 More importantly, it confirmed my interest in **graphics programming and real-time rendering**, and provided a strong foundation for future engine and rendering work.
 
 The full source code and builds are available on GitHub for anyone interested in exploring the implementation details.
+
+![Final demo](/Source/Enregistrement 2026-02-10 210312.gif)
 
